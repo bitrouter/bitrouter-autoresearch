@@ -1,0 +1,24 @@
+# BitRouter Bench configuration
+# Override any BenchConfig defaults here.
+
+bitrouter_url: "http://localhost:8787"
+openclaw_bin: "openclaw"
+conditions:
+  - bitrouter_auto
+  - direct_opus
+repeats: 3
+default_max_turns: 20
+
+# Budget per difficulty tier (USD)
+budget_easy: 0.05
+budget_medium: 0.10
+budget_hard: 0.20
+
+# Harness LLM models (called directly, not through BitRouter)
+judge_model: "claude-sonnet-4-6-20250514"
+user_agent_model: "claude-sonnet-4-6-20250514"
+
+# Scoring weights
+weight_completion: 0.5
+weight_interaction: 0.3
+weight_efficiency: 0.2

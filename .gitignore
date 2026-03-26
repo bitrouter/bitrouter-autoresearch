@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+*.log
+
+# Results trajectories are git-tracked, but the TSV summary is not
+results/results.tsv
