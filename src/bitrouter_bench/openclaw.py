@@ -1,10 +1,11 @@
-"""Programmatic interface to OpenClaw CLI."""
+"""Programmatic interface to OpenClaw CLI — gateway mode."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,64 +23,48 @@ class OpenClawResponse:
 
 
 class OpenClawRunner:
-    """Invoke OpenClaw as a subprocess for each agent turn."""
+    """Invoke OpenClaw agents via the Gateway.
+
+    Each agent is identified by its agent ID (e.g. bench-test, bench-user,
+    bench-judge).  Messages are routed through the running OpenClaw gateway,
+    giving agents access to the full tool suite (browser, filesystem, etc.).
+    """
 
     def __init__(
         self,
-        openclaw_bin: str,
-        state_dir: Path,
-        timeout_seconds: int = 300,
-        workspace: Path | None = None,
+        openclaw_bin: str = "openclaw",
+        timeout_seconds: int = 600,
     ) -> None:
         self._bin = openclaw_bin
-        self._state_dir = state_dir
         self._timeout = timeout_seconds
-        self._workspace = workspace
 
     async def send_message(
         self,
         message: str,
+        *,
+        agent_id: str,
         session_id: str,
         thinking: str = "medium",
     ) -> OpenClawResponse:
-        """Send a message to OpenClaw and return the agent's response.
+        """Send a message to a named OpenClaw agent via the gateway.
 
-        Runs: openclaw agent --local --message "<msg>" --session-id <id>
-              --json --timeout <T> --thinking <level>
+        Runs: openclaw agent --agent <id> --message "<msg>"
+              --session-id <sid> --json --timeout <T> --thinking <level>
         """
         cmd = [
             self._bin,
             "agent",
-            "--local",
-            "--message",
-            message,
-            "--session-id",
-            session_id,
+            "--agent", agent_id,
+            "--message", message,
+            "--session-id", session_id,
             "--json",
-            "--timeout",
-            str(self._timeout),
-            "--thinking",
-            thinking,
+            "--timeout", str(self._timeout),
+            "--thinking", thinking,
         ]
 
-        env = {
-            "OPENCLAW_STATE_DIR": str(self._state_dir.resolve()),
-            "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
-            "HOME": str(Path.home()),
-        }
-
-        # Inherit common env vars
-        import os
-
-        for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "BITROUTER_API_KEY"):
-            val = os.environ.get(key)
-            if val:
-                env[key] = val
-
-        cwd = str(self._workspace) if self._workspace else None
+        env = dict(os.environ)
 
         logger.debug("OpenClaw cmd: %s", " ".join(cmd))
-        logger.debug("OpenClaw state_dir: %s", self._state_dir)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -87,11 +72,10 @@ class OpenClawRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                cwd=cwd,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
-                timeout=self._timeout + 30,  # grace period
+                timeout=self._timeout + 30,
             )
         except asyncio.TimeoutError:
             logger.error("OpenClaw timed out after %ds", self._timeout)
@@ -104,7 +88,10 @@ class OpenClawRunner:
 
         if proc.returncode != 0:
             err_msg = stderr.decode(errors="replace").strip()
-            logger.error("OpenClaw exited %d: %s", proc.returncode, err_msg)
+            logger.error(
+                "OpenClaw agent=%s exited %d: %s",
+                agent_id, proc.returncode, err_msg,
+            )
             return OpenClawResponse(error=err_msg, status="error")
 
         return self._parse_output(stdout.decode(errors="replace"))
@@ -134,5 +121,35 @@ class OpenClawRunner:
                     error="Could not parse JSON from OpenClaw output",
                 )
 
-        text = data.get("text", "") or data.get("summary", "") or data.get("result", "")
+        text = self._extract_text(data)
         return OpenClawResponse(text=text, status="ok", raw=data)
+
+    @staticmethod
+    def _extract_text(data: dict) -> str:
+        """Extract the agent's reply text from OpenClaw JSON output.
+
+        The response structure is:
+          { "result": { "payloads": [{ "text": "..." }] }, "summary": "completed" }
+
+        The actual agent text is in result.payloads[*].text.
+        The top-level "summary" is just a status indicator ("completed").
+        """
+        # Primary: result.payloads[].text
+        result = data.get("result", {})
+        if isinstance(result, dict):
+            payloads = result.get("payloads", [])
+            if payloads:
+                parts = [
+                    p.get("text", "")
+                    for p in payloads
+                    if isinstance(p, dict) and p.get("text")
+                ]
+                if parts:
+                    return "\n".join(parts)
+
+        # Fallback: top-level text field
+        if data.get("text"):
+            return data["text"]
+
+        # Last resort
+        return data.get("summary", "")

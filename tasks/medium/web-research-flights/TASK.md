@@ -4,7 +4,7 @@ description: Research flight options from SFO to Tokyo, requiring multi-turn cla
 metadata:
   difficulty: medium
   category: information_retrieval
-  budget_usd: "0.10"
+  budget_usd: "0.50"
   max_turns: 15
   version: "1.0"
 ---

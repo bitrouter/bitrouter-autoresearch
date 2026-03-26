@@ -27,7 +27,7 @@ console = Console()
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
 @click.pass_context
 def main(ctx: click.Context, config_path: str, verbose: bool) -> None:
-    """BitRouter Bench — benchmark harness for evaluating LLM routing."""
+    """BitRouter Bench -- benchmark harness for evaluating LLM routing."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -47,6 +47,8 @@ def main(ctx: click.Context, config_path: str, verbose: bool) -> None:
     help="Start API server for live observation (default: port 8788).",
 )
 @click.option("--port", type=int, default=8788, help="API server port (with --live).")
+@click.option("--no-shuffle", is_flag=True, help="Disable trial order randomization.")
+@click.option("--skip-preflight", is_flag=True, help="Skip pre-flight checks (not recommended).")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -56,25 +58,44 @@ def run(
     repeats: int | None,
     live: bool,
     port: int,
+    no_shuffle: bool,
+    skip_preflight: bool,
 ) -> None:
     """Run benchmark trials."""
     from bitrouter_bench.judge import Judge, save_verdict
+    from bitrouter_bench.openclaw import OpenClawRunner
     from bitrouter_bench.runner import BenchRunner
     from bitrouter_bench.trajectory import trial_dir
 
     config: BenchConfig = ctx.obj["config"]
-    runner = BenchRunner(config, live=live)
-    judge = Judge(
-        model=config.judge_model,
-        weights=(config.weight_completion, config.weight_interaction, config.weight_efficiency),
-    )
 
-    console.print(f"[bold]BitRouter Bench[/bold] — running trials")
+    console.print("[bold]BitRouter Bench[/bold] -- running trials")
     console.print(f"  BitRouter: {config.bitrouter_url}")
     console.print(f"  Tasks dir: {config.tasks_dir}")
     if live:
         console.print(f"  Live API:  http://localhost:{port}")
     console.print()
+
+    # Pre-flight checks (hard gate)
+    if not skip_preflight:
+        from bitrouter_bench.preflight import Preflight
+
+        console.print("[bold]Running pre-flight checks...[/bold]")
+        try:
+            asyncio.run(Preflight(config).run())
+            console.print("[green]All pre-flight checks passed.[/green]\n")
+        except SystemExit:
+            raise
+    else:
+        console.print("[yellow]Skipping pre-flight checks (--skip-preflight)[/yellow]\n")
+
+    runner = BenchRunner(config, live=live)
+    openclaw = OpenClawRunner(openclaw_bin=config.openclaw_bin)
+    judge = Judge(
+        openclaw=openclaw,
+        agent_id=config.agent_id_judge,
+        weights=(config.weight_completion, config.weight_interaction, config.weight_efficiency),
+    )
 
     async def _run_with_server() -> list:
         """Run trials, optionally with an API server in the background."""
@@ -90,7 +111,6 @@ def run(
             server = uvicorn.Server(server_config)
             server_task = asyncio.create_task(server.serve())
 
-            # Give the server a moment to start
             await asyncio.sleep(0.5)
             console.print(f"[green]Live API server started on port {port}[/green]\n")
 
@@ -99,10 +119,10 @@ def run(
             difficulty_filter=difficulty,
             condition_filter=condition,
             repeats=repeats,
+            shuffle=not no_shuffle,
         )
 
         if live:
-            # Keep the server running briefly so clients get the final events
             await asyncio.sleep(2)
             server.should_exit = True
             await server_task
@@ -147,7 +167,11 @@ def run(
         )
 
         verdict = asyncio.run(
-            judge.evaluate(task, traj, budget_usd=budget),
+            judge.evaluate(
+                task, traj,
+                workspace=traj.workspace or None,
+                budget_usd=budget,
+            ),
         )
 
         output = trial_dir(config.results_dir, traj.trial_id)
@@ -168,6 +192,68 @@ def run(
     console.print(results_table)
 
 
+@main.command("generate-tasks")
+@click.option("--count", type=int, default=10, help="Number of tasks to generate.")
+@click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
+@click.option(
+    "--output",
+    "output_dir",
+    type=click.Path(),
+    default=None,
+    help="Output directory (default: tasks/generated/).",
+)
+@click.pass_context
+def generate_tasks(
+    ctx: click.Context,
+    count: int,
+    seed: int | None,
+    output_dir: str | None,
+) -> None:
+    """Generate benchmark tasks using LLM."""
+    from bitrouter_bench.openclaw import OpenClawRunner
+    from bitrouter_bench.task_generator import GenerationConfig, TaskGenerator
+
+    config: BenchConfig = ctx.obj["config"]
+    out = Path(output_dir) if output_dir else config.generated_tasks_dir
+
+    gen_config = GenerationConfig(
+        max_tasks_per_run=count,
+        seed=seed or config.generate_seed,
+    )
+
+    openclaw = OpenClawRunner(openclaw_bin=config.openclaw_bin)
+    generator = TaskGenerator(openclaw=openclaw, config=gen_config)
+
+    console.print(f"[bold]Generating {count} benchmark tasks...[/bold]")
+    console.print(f"  Output: {out}")
+    console.print(f"  Seed: {seed or 'random'}")
+    console.print()
+
+    tasks = asyncio.run(generator.generate_and_save(out, count=count))
+
+    if not tasks:
+        console.print("[yellow]No tasks were generated.[/yellow]")
+        return
+
+    table = Table(title=f"Generated {len(tasks)} Tasks")
+    table.add_column("Task ID", style="cyan")
+    table.add_column("Difficulty", style="magenta")
+    table.add_column("Category")
+    table.add_column("Assertions", justify="right")
+    table.add_column("Description")
+
+    for task in tasks:
+        table.add_row(
+            task.task_id,
+            task.meta.difficulty,
+            task.meta.category,
+            str(len(task.eval_criteria.programmatic_assertions)),
+            task.meta.description[:60],
+        )
+
+    console.print(table)
+
+
 @main.command()
 @click.option("--port", type=int, default=8788, help="Port to listen on.")
 @click.option("--host", type=str, default="0.0.0.0", help="Host to bind to.")
@@ -181,7 +267,7 @@ def serve(ctx: click.Context, port: int, host: str) -> None:
     config: BenchConfig = ctx.obj["config"]
     app = create_app(config)
 
-    console.print(f"[bold]BitRouter Bench API[/bold]")
+    console.print("[bold]BitRouter Bench API[/bold]")
     console.print(f"  http://{host}:{port}")
     console.print(f"  Docs: http://localhost:{port}/docs")
     console.print()
@@ -259,9 +345,6 @@ def validate_tasks(ctx: click.Context) -> None:
 @click.pass_context
 def results(ctx: click.Context, fmt: str) -> None:
     """Aggregate and display benchmark results."""
-    from bitrouter_bench.judge import JudgmentResult
-    from bitrouter_bench.trajectory import load_trajectory
-
     config: BenchConfig = ctx.obj["config"]
     runs_dir = config.results_dir
 

@@ -33,6 +33,7 @@ class Trajectory(BaseModel):
     stop_reason: str = ""  # "user_stop", "budget_exceeded", "max_turns", "timeout", "error"
     started_at: str = ""
     ended_at: str = ""
+    workspace: str = ""  # agent workspace path (for assertion evaluation)
     metrics_before: dict = Field(default_factory=dict)
     metrics_after: dict = Field(default_factory=dict)
 
@@ -69,6 +70,7 @@ def save_metadata(output_dir: Path, trajectory: Trajectory) -> None:
         "started_at": trajectory.started_at,
         "ended_at": trajectory.ended_at,
         "turn_count": len(trajectory.turns),
+        "workspace": trajectory.workspace,
         "metrics_before": trajectory.metrics_before,
         "metrics_after": trajectory.metrics_after,
     }

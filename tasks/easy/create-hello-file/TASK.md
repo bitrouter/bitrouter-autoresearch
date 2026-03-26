@@ -4,7 +4,7 @@ description: Create a text file with specific content. Tests basic file creation
 metadata:
   difficulty: easy
   category: file_management
-  budget_usd: "0.05"
+  budget_usd: "0.25"
   max_turns: 10
   version: "1.0"
 ---

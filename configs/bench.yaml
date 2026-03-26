@@ -10,11 +10,21 @@ repeats: 3
 default_max_turns: 20
 
 # Budget per difficulty tier (USD)
-budget_easy: 0.05
-budget_medium: 0.10
-budget_hard: 0.20
+# Gateway-mode agents have ~20K token system prompt overhead per turn.
+budget_easy: 0.25
+budget_medium: 0.50
+budget_hard: 1.00
 
-# Harness LLM models (called directly, not through BitRouter)
+# OpenClaw agent IDs (must match `openclaw agents list`)
+agent_id_user: "bench-user"
+agent_id_judge: "bench-judge"
+
+# Map conditions to test agent IDs (each has a different model)
+condition_agent_map:
+  bitrouter_auto: "bench-test-auto"    # model: bitrouter/auto
+  direct_opus: "bench-test-opus"       # model: anthropic:claude-opus-4-6-20250514
+
+# Harness LLM models (routed through OpenClaw gateway → BitRouter)
 judge_model: "claude-sonnet-4-6-20250514"
 user_agent_model: "claude-sonnet-4-6-20250514"
 
@@ -22,3 +32,7 @@ user_agent_model: "claude-sonnet-4-6-20250514"
 weight_completion: 0.5
 weight_interaction: 0.3
 weight_efficiency: 0.2
+
+# Task generation
+generate_count: 10
+# generate_seed: 42  # uncomment for reproducible generation

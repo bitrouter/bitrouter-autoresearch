@@ -1,8 +1,8 @@
-"""LLM-based user simulator (tau-bench style).
+"""LLM-based user simulator running through OpenClaw gateway.
 
 The UserAgent plays the role of a human user interacting with the execution
-agent (OpenClaw).  It receives the task's UserScenario (persona, known info,
-unknown info, instructions) but NEVER the evaluation criteria.
+agent (OpenClaw bench-test).  It receives the task's UserScenario (persona,
+known info, unknown info, instructions) but NEVER the evaluation criteria.
 
 Design principles (from tau-bench):
 - Progressive disclosure: reveal Unknown Info only when asked.
@@ -14,145 +14,140 @@ Design principles (from tau-bench):
 from __future__ import annotations
 
 import logging
-import os
 import re
+import uuid
 
-import httpx
-
+from bitrouter_bench.openclaw import OpenClawRunner
 from bitrouter_bench.task_loader import UserScenario
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
-_SYSTEM_PROMPT_TEMPLATE = """\
-You are role-playing as a human user interacting with an AI assistant.
+def _build_session_prompt(
+    scenario: UserScenario,
+    persona_params: dict | None = None,
+) -> str:
+    """Build the per-session system instruction for the user simulator.
+
+    This is sent as the first message to the bench-user agent, instructing it
+    on how to behave for this specific trial.  The SOUL.md in the agent's
+    workspace provides the base personality; this adds the scenario specifics.
+    """
+    params = persona_params or {}
+    verbosity = params.get("verbosity", 3)
+    patience = params.get("patience", 5)
+    disclosure = params.get("disclosure_style", "only_when_asked")
+    completion_bar = params.get("completion_bar", "medium")
+
+    return f"""\
+=== SCENARIO START ===
+You are now role-playing as a human user for this benchmark trial.
 Stay in character for the entire conversation.
 
 ## Your Persona
-{persona}
+{scenario.persona or "A general user."}
+
+## Behavioral Parameters
+- verbosity: {verbosity} (1=terse, 5=chatty)
+- patience: {patience} (1=easily frustrated, 10=endlessly patient)
+- disclosure_style: {disclosure}
+- completion_bar: {completion_bar}
 
 ## What You Know
-{known_info}
+{scenario.known_info or "No specific information provided."}
 
-## What You Also Know (reveal ONLY when the assistant asks a relevant question)
-{unknown_info}
+## What You Also Know (reveal ONLY per disclosure_style rules)
+{scenario.unknown_info or "Nothing additional."}
 
 ## Your Goal
-{instructions}
+{scenario.instructions or "Complete the task described above."}
 
 ## Rules
 - Start by stating your initial request based on What You Know.
-- Only reveal information from "What You Also Know" when the assistant
-  asks a question that directly relates to that information.
-- When your goal has been accomplished satisfactorily, respond with
-  exactly the word STOP on its own line (you may add a brief thank-you
-  before it).
-- Be a realistic user: ask follow-ups if something is unclear, express
-  preferences, push back if the assistant makes wrong assumptions.
-- Keep your messages concise and natural — do not dump all information
-  at once.
+- If disclosure_style is "only_when_asked": reveal hidden info only when the
+  assistant asks a directly relevant question.
+- If disclosure_style is "volunteer": you may naturally mention hidden info
+  when it feels relevant, but don't dump everything at once.
+- If disclosure_style is "contradicts": occasionally give slightly inconsistent
+  info, then correct yourself when pressed.
+- When your goal has been accomplished to your satisfaction (per completion_bar),
+  respond with exactly the word STOP on its own line.
+- Be realistic. Match the verbosity and patience levels.
 - NEVER mention evaluation criteria, scores, or that you are a simulator.
-- If the assistant asks for clarification you cannot answer based on your
-  scenario, say you are not sure or defer to the assistant's judgment.
-"""
+- If the assistant asks for information outside your scenario, say you're not
+  sure or defer to their judgment.
+
+Now generate your opening message to the AI assistant.
+=== SCENARIO END ==="""
 
 
 class UserAgent:
-    """Simulated user that drives multi-turn interaction with the agent."""
+    """Simulated user that drives multi-turn interaction via OpenClaw gateway."""
 
     def __init__(
         self,
         scenario: UserScenario,
-        model: str = "claude-sonnet-4-6-20250514",
-        api_key: str | None = None,
-        max_tokens: int = 1024,
+        openclaw: OpenClawRunner,
+        agent_id: str = "bench-user",
+        persona_params: dict | None = None,
     ) -> None:
-        self._model = model
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        self._max_tokens = max_tokens
-        self._system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
-            persona=scenario.persona or "A general user.",
-            known_info=scenario.known_info or "No specific information provided.",
-            unknown_info=scenario.unknown_info or "Nothing additional.",
-            instructions=scenario.instructions or "Complete the task described above.",
-        )
-        # Role-flipped history: UserAgent's own messages = "assistant",
-        # real agent's messages = "user"
-        self._messages: list[dict[str, str]] = []
+        self._scenario = scenario
+        self._openclaw = openclaw
+        self._agent_id = agent_id
+        self._session_id = f"bench-user-{uuid.uuid4().hex[:12]}"
+        self._persona_params = persona_params
+        self._turn_count = 0
         self.stopped = False
 
     async def get_initial_message(self) -> str:
-        """Generate the opening user message based on Known Info."""
-        response = await self._call_llm(
-            extra_instruction=(
-                "Generate your opening message to the AI assistant. "
-                "State your request based on What You Know. "
-                "Keep it natural and concise."
-            ),
+        """Generate the opening user message based on Known Info.
+
+        Sends the scenario prompt to the bench-user agent, which generates
+        the simulated user's opening message.
+        """
+        prompt = _build_session_prompt(self._scenario, self._persona_params)
+        resp = await self._openclaw.send_message(
+            prompt,
+            agent_id=self._agent_id,
+            session_id=self._session_id,
+            thinking="low",
         )
-        self._messages.append({"role": "assistant", "content": response})
-        return response
+        if resp.status != "ok":
+            raise RuntimeError(f"UserAgent failed to generate initial message: {resp.error}")
+
+        self._turn_count += 1
+        return resp.text
 
     async def respond_to_agent(self, agent_message: str) -> str:
         """Generate the next user message in response to the agent's reply.
 
-        The agent's message is added as role="user" (role-flip) and the
-        LLM generates the next "assistant" completion which becomes the
-        user's reply.
+        We send the test agent's response to the bench-user agent, which
+        generates the simulated user's next message.
         """
-        self._messages.append({"role": "user", "content": agent_message})
+        # Prefix with context so the user-simulator knows this is the
+        # assistant's reply it should respond to
+        prompt = (
+            f"The AI assistant replied:\n\n{agent_message}\n\n"
+            "Now respond as the user. Remember your persona and rules."
+        )
 
-        response = await self._call_llm()
-        self._messages.append({"role": "assistant", "content": response})
+        resp = await self._openclaw.send_message(
+            prompt,
+            agent_id=self._agent_id,
+            session_id=self._session_id,
+            thinking="low",
+        )
+        if resp.status != "ok":
+            raise RuntimeError(f"UserAgent failed: {resp.error}")
 
-        if self._is_stop(response):
+        self._turn_count += 1
+
+        if self._is_stop(resp.text):
             self.stopped = True
 
-        return response
-
-    async def _call_llm(self, extra_instruction: str | None = None) -> str:
-        """Call the Anthropic Messages API directly (not through BitRouter)."""
-        system = self._system_prompt
-        if extra_instruction:
-            system += f"\n\n## Current Instruction\n{extra_instruction}"
-
-        payload = {
-            "model": self._model,
-            "max_tokens": self._max_tokens,
-            "system": system,
-            "messages": self._messages if self._messages else [
-                {"role": "user", "content": "Begin."},
-            ],
-        }
-
-        headers = {
-            "x-api-key": self._api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                ANTHROPIC_API_URL,
-                json=payload,
-                headers=headers,
-                timeout=60,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        # Extract text from content blocks
-        content_blocks = data.get("content", [])
-        text_parts = [
-            block["text"]
-            for block in content_blocks
-            if block.get("type") == "text"
-        ]
-        return "\n".join(text_parts)
+        return resp.text
 
     @staticmethod
     def _is_stop(message: str) -> bool:
         """Check if the user's message indicates task completion."""
-        # Match STOP on its own line (possibly with surrounding whitespace/thanks)
         return bool(re.search(r"(?m)^\s*STOP\s*$", message))

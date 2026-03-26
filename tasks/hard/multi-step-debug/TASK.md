@@ -4,7 +4,7 @@ description: Debug a broken Python script, fix it, write tests, and verify they 
 metadata:
   difficulty: hard
   category: code_task
-  budget_usd: "0.20"
+  budget_usd: "1.00"
   max_turns: 20
   version: "1.0"
 ---

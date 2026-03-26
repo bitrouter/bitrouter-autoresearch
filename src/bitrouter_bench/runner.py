@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tempfile
+import random
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from bitrouter_bench.config import BenchConfig, budget_for_difficulty
 from bitrouter_bench.cost_meter import CostMeter
+from bitrouter_bench.events import Event, event_bus
 from bitrouter_bench.openclaw import OpenClawRunner
 from bitrouter_bench.task_loader import Task, discover_tasks
 from bitrouter_bench.trajectory import (
@@ -21,27 +22,53 @@ from bitrouter_bench.trajectory import (
     save_turn,
     trial_dir,
 )
-from bitrouter_bench.events import Event, event_bus
 from bitrouter_bench.user_agent import UserAgent
 
 logger = logging.getLogger(__name__)
 
 
 class TrialRunner:
-    """Run a single trial: one task × one condition."""
+    """Run a single trial: one task x one condition."""
 
     def __init__(
         self,
         task: Task,
         condition: str,
         config: BenchConfig,
+        openclaw: OpenClawRunner,
         live: bool = False,
     ) -> None:
         self._task = task
         self._condition = condition
         self._config = config
+        self._openclaw = openclaw
         self._live = live
         self._trial_id = ""
+
+    @staticmethod
+    def _resolve_agent_workspace(agent_id: str) -> Path:
+        """Resolve the workspace directory for an OpenClaw agent.
+
+        OpenClaw agents have their workspace at ~/.openclaw/workspace-<id>/
+        or as configured in openclaw.json. We read it from the config.
+        """
+        import json
+
+        config_path = Path.home() / ".openclaw" / "openclaw.json"
+        if config_path.exists():
+            try:
+                data = json.loads(config_path.read_text())
+                agents = data.get("agents", {}).get("list", [])
+                for agent in agents:
+                    if agent.get("id") == agent_id:
+                        ws = agent.get("workspace")
+                        if ws:
+                            return Path(ws)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Fallback: conventional path
+        return Path.home() / ".openclaw" / f"workspace-{agent_id}"
 
     async def _emit(self, event_type: str, data: dict) -> None:
         """Publish an event to the live stream (no-op if --live not set)."""
@@ -68,21 +95,22 @@ class TrialRunner:
         max_turns = self._task.meta.max_turns or self._config.default_max_turns
         session_id = str(uuid.uuid4())
 
-        # Set up workspace isolation
-        workspace = Path(tempfile.mkdtemp(prefix=f"bench_{trial_id}_"))
-
-        # Resolve OpenClaw state dir for this condition
-        state_dir = self._config.openclaw_config_dir / f"openclaw_{self._condition}"
-
-        openclaw = OpenClawRunner(
-            openclaw_bin=self._config.openclaw_bin,
-            state_dir=state_dir,
-            timeout_seconds=300,
-            workspace=workspace,
+        # Use the test agent's OpenClaw workspace as the bench workspace.
+        # The agent's file tools (read/write/exec) operate relative to this dir.
+        # This ensures assertions can find files the agent creates.
+        test_agent_id = self._config.condition_agent_map.get(
+            self._condition, "bench-test-auto",
         )
+        workspace = self._resolve_agent_workspace(test_agent_id)
+
+        # Resolve persona params if available on the task
+        persona_params = getattr(self._task, "_persona_params", None)
+
         user_agent = UserAgent(
             scenario=self._task.scenario,
-            model=self._config.user_agent_model,
+            openclaw=self._openclaw,
+            agent_id=self._config.agent_id_user,
+            persona_params=persona_params,
         )
         cost_meter = CostMeter(self._config.bitrouter_url)
 
@@ -90,6 +118,7 @@ class TrialRunner:
             trial_id=trial_id,
             task_id=self._task.task_id,
             condition=self._condition,
+            workspace=str(workspace),
             started_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -135,10 +164,19 @@ class TrialRunner:
             await self._emit("turn", user_turn.model_dump())
             turn_num += 1
 
-            # Send to OpenClaw
-            agent_resp = await openclaw.send_message(user_msg, session_id)
+            # Send to test agent via OpenClaw gateway
+            # Condition determines which agent (and thus which model) is used
+            test_agent_id = self._config.condition_agent_map.get(
+                self._condition, "bench-test-auto",
+            )
+            agent_resp = await self._openclaw.send_message(
+                user_msg,
+                agent_id=test_agent_id,
+                session_id=session_id,
+                thinking="medium",
+            )
 
-            if agent_resp.status == "error" or agent_resp.status == "timeout":
+            if agent_resp.status in ("error", "timeout"):
                 logger.error("OpenClaw error: %s", agent_resp.error)
                 stop_reason = "error" if agent_resp.status == "error" else "timeout"
                 break
@@ -154,6 +192,16 @@ class TrialRunner:
             save_turn(output, agent_turn)
             await self._emit("turn", agent_turn.model_dump())
             turn_num += 1
+
+            # Per-turn endpoint diff — log which model was selected
+            try:
+                endpoint_delta = await cost_meter.turn_diff()
+                if endpoint_delta:
+                    agent_turn.openclaw_raw = agent_turn.openclaw_raw or {}
+                    agent_turn.openclaw_raw["_bitrouter_endpoints"] = endpoint_delta
+                    logger.debug("Turn %d model selection: %s", turn_num, endpoint_delta)
+            except Exception:
+                pass
 
             # Check budget
             try:
@@ -222,7 +270,7 @@ class TrialRunner:
 
 
 class BenchRunner:
-    """Orchestrate a full benchmark run across tasks × conditions × repeats."""
+    """Orchestrate a full benchmark run across tasks x conditions x repeats."""
 
     def __init__(self, config: BenchConfig, live: bool = False) -> None:
         self._config = config
@@ -234,6 +282,7 @@ class BenchRunner:
         difficulty_filter: str | None = None,
         condition_filter: str | None = None,
         repeats: int | None = None,
+        shuffle: bool = True,
     ) -> list[Trajectory]:
         """Run the benchmark and return all trajectories."""
         tasks = discover_tasks(self._config.tasks_dir, difficulty_filter)
@@ -250,31 +299,43 @@ class BenchRunner:
         )
         num_repeats = repeats if repeats is not None else self._config.repeats
 
-        trajectories: list[Trajectory] = []
-        total = len(tasks) * len(conditions) * num_repeats
+        # Build trial plan: list of (task, condition, repeat)
+        plan: list[tuple[Task, str, int]] = []
+        for condition in conditions:
+            for task in tasks:
+                for repeat in range(num_repeats):
+                    plan.append((task, condition, repeat))
 
+        # Shuffle to prevent ordering bias (caching, warm-up effects)
+        if shuffle:
+            random.shuffle(plan)
+
+        total = len(plan)
         logger.info(
-            "Running %d trials (%d tasks × %d conditions × %d repeats)",
+            "Running %d trials (%d tasks x %d conditions x %d repeats)%s",
             total,
             len(tasks),
             len(conditions),
             num_repeats,
+            " (shuffled)" if shuffle else "",
         )
 
-        # Group by condition to minimize config switching
-        for condition in conditions:
-            logger.info("=== Condition: %s ===", condition)
-            for task in tasks:
-                for repeat in range(num_repeats):
-                    logger.info(
-                        "  [%d/%d] %s (repeat %d)",
-                        len(trajectories) + 1,
-                        total,
-                        task.task_id,
-                        repeat + 1,
-                    )
-                    trial = TrialRunner(task, condition, self._config, live=self._live)
-                    trajectory = await trial.run()
-                    trajectories.append(trajectory)
+        # Shared OpenClaw runner for all trials
+        openclaw = OpenClawRunner(
+            openclaw_bin=self._config.openclaw_bin,
+        )
+
+        trajectories: list[Trajectory] = []
+
+        for i, (task, condition, repeat) in enumerate(plan):
+            logger.info(
+                "  [%d/%d] %s | %s (repeat %d)",
+                i + 1, total, task.task_id, condition, repeat + 1,
+            )
+            trial = TrialRunner(
+                task, condition, self._config, openclaw, live=self._live,
+            )
+            trajectory = await trial.run()
+            trajectories.append(trajectory)
 
         return trajectories

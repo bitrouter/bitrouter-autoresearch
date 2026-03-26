@@ -16,6 +16,7 @@ class BenchConfig(BaseModel):
 
     tasks_dir: Path = Path("tasks")
     results_dir: Path = Path("results/runs")
+    generated_tasks_dir: Path = Path("tasks/generated")
     openclaw_config_dir: Path = Path("configs")
 
     conditions: list[str] = Field(
@@ -25,11 +26,24 @@ class BenchConfig(BaseModel):
     default_max_turns: int = 20
 
     # Budget defaults per difficulty (USD)
-    budget_easy: float = 0.05
-    budget_medium: float = 0.10
-    budget_hard: float = 0.20
+    # Note: gateway-mode agents have ~20K token system prompt overhead per turn.
+    # Budgets account for this baseline cost.
+    budget_easy: float = 0.25
+    budget_medium: float = 0.50
+    budget_hard: float = 1.00
 
-    # Models used by the harness itself (NOT through BitRouter)
+    # OpenClaw agent IDs
+    agent_id_user: str = "bench-user"
+    agent_id_judge: str = "bench-judge"
+
+    # Map condition names to OpenClaw test agent IDs.
+    # Each condition uses a different agent with a different model configured.
+    condition_agent_map: dict[str, str] = Field(default_factory=lambda: {
+        "bitrouter_auto": "bench-test-auto",
+        "direct_opus": "bench-test-opus",
+    })
+
+    # Models used by harness agents (through OpenClaw gateway → BitRouter)
     judge_model: str = "claude-sonnet-4-6-20250514"
     user_agent_model: str = "claude-sonnet-4-6-20250514"
 
@@ -37,6 +51,10 @@ class BenchConfig(BaseModel):
     weight_completion: float = 0.5
     weight_interaction: float = 0.3
     weight_efficiency: float = 0.2
+
+    # Task generation defaults
+    generate_count: int = 10
+    generate_seed: int | None = None
 
 
 def load_config(path: Path | None = None) -> BenchConfig:

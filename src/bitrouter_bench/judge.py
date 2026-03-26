@@ -1,41 +1,20 @@
-"""Hybrid evaluation: programmatic assertions + LLM-as-judge."""
+"""Hybrid evaluation: programmatic assertions + LLM-as-judge via OpenClaw."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import subprocess
+import uuid
 
-import httpx
 from pydantic import BaseModel
 
+from bitrouter_bench.openclaw import OpenClawRunner
 from bitrouter_bench.task_loader import Task
 from bitrouter_bench.trajectory import Trajectory
 
 logger = logging.getLogger(__name__)
-
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-
-_JUDGE_SYSTEM_PROMPT = """\
-You are an impartial judge evaluating an AI assistant's performance on a user task.
-You will see a conversation transcript between a user and an assistant.
-You do NOT know which system or model produced the assistant's responses.
-Evaluate objectively based solely on the conversation quality.
-
-Respond with a JSON object containing:
-- "interaction_quality": a float between 0.0 and 1.0
-- "reasoning": a brief explanation of your rating
-
-Scoring guide for interaction_quality:
-- 1.0: Exceptional — natural conversation, efficient, asked great clarifying questions
-- 0.8: Good — mostly smooth, minor inefficiencies
-- 0.6: Adequate — completed the task but interaction was clunky or verbose
-- 0.4: Below average — significant issues in communication or approach
-- 0.2: Poor — major problems, unhelpful responses, wrong assumptions
-- 0.0: Failed — completely unhelpful or harmful interaction
-"""
 
 
 class JudgmentResult(BaseModel):
@@ -52,16 +31,20 @@ class JudgmentResult(BaseModel):
 
 
 class Judge:
-    """Hybrid evaluator combining programmatic checks and LLM judgment."""
+    """Hybrid evaluator combining programmatic checks and LLM judgment.
+
+    The LLM evaluation runs through the bench-judge OpenClaw agent via
+    the gateway, keeping all three agents on the same infrastructure.
+    """
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-6-20250514",
-        api_key: str | None = None,
+        openclaw: OpenClawRunner,
+        agent_id: str = "bench-judge",
         weights: tuple[float, float, float] = (0.5, 0.3, 0.2),
     ) -> None:
-        self._model = model
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self._openclaw = openclaw
+        self._agent_id = agent_id
         self._w_completion, self._w_interaction, self._w_efficiency = weights
 
     async def evaluate(
@@ -147,13 +130,16 @@ class Judge:
         task: Task,
         trajectory: Trajectory,
     ) -> tuple[float, str]:
-        """Call LLM judge with a blind transcript. Returns (score, reasoning)."""
+        """Call LLM judge via bench-judge agent. Returns (score, reasoning)."""
         if not task.eval_criteria.llm_judge_prompt:
             return 0.5, "No LLM judge prompt defined; defaulting to 0.5"
 
         transcript = self._format_transcript(trajectory)
+        session_id = f"bench-judge-{uuid.uuid4().hex[:12]}"
 
-        user_prompt = f"""\
+        prompt = f"""\
+Evaluate this AI assistant interaction. Respond with ONLY a JSON object.
+
 ## Task Description
 {task.meta.description}
 
@@ -163,38 +149,34 @@ class Judge:
 ## Evaluation Focus
 {task.eval_criteria.llm_judge_prompt}
 
+## Expected Output Format
+Respond with a JSON object containing:
+- "interaction_quality": a float between 0.0 and 1.0
+- "reasoning": a brief explanation citing specific transcript evidence
+
 Rate the interaction and respond with JSON only."""
 
-        headers = {
-            "x-api-key": self._api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-
-        payload = {
-            "model": self._model,
-            "max_tokens": 1024,
-            "system": _JUDGE_SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
-
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    ANTHROPIC_API_URL,
-                    json=payload,
-                    headers=headers,
-                    timeout=60,
+            resp = await self._openclaw.send_message(
+                prompt,
+                agent_id=self._agent_id,
+                session_id=session_id,
+                thinking="medium",
+            )
+            if resp.status != "ok":
+                logger.error("Judge agent error: %s", resp.error)
+                return 0.5, f"Judge agent error: {resp.error}"
+
+            # Parse JSON from response — may be wrapped in markdown code block
+            text = resp.text.strip()
+            if text.startswith("```"):
+                # Strip markdown code fences
+                lines = text.splitlines()
+                text = "\n".join(
+                    line for line in lines
+                    if not line.strip().startswith("```")
                 )
-                resp.raise_for_status()
-                data = resp.json()
 
-            text = ""
-            for block in data.get("content", []):
-                if block.get("type") == "text":
-                    text += block["text"]
-
-            # Parse JSON from response
             result = json.loads(text)
             quality = float(result.get("interaction_quality", 0.5))
             reasoning = result.get("reasoning", "")
@@ -203,9 +185,9 @@ Rate the interaction and respond with JSON only."""
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning("Failed to parse judge response: %s", exc)
             return 0.5, f"Judge parse error: {exc}"
-        except httpx.HTTPError as exc:
-            logger.error("Judge API call failed: %s", exc)
-            return 0.5, f"Judge API error: {exc}"
+        except Exception as exc:
+            logger.error("Judge evaluation failed: %s", exc)
+            return 0.5, f"Judge error: {exc}"
 
     @staticmethod
     def _format_transcript(trajectory: Trajectory) -> str:

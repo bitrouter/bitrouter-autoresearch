@@ -1,4 +1,7 @@
-"""Cost metering via BitRouter's /v1/metrics endpoint."""
+"""Cost metering via BitRouter's /v1/metrics endpoint.
+
+Supports per-turn endpoint diffing to track which model BitRouter selected.
+"""
 
 from __future__ import annotations
 
@@ -39,12 +42,17 @@ class MetricsSnapshot:
         total_in = 0
         total_out = 0
 
-        # Walk route-level metrics
         routes = data.get("routes", {})
         for _route_name, route_data in routes.items():
             total_req += route_data.get("total_requests", 0)
-            total_in += route_data.get("total_input_tokens", 0)
-            total_out += route_data.get("total_output_tokens", 0)
+            total_in += int(
+                route_data.get("avg_input_tokens", 0)
+                * route_data.get("total_requests", 0)
+            )
+            total_out += int(
+                route_data.get("avg_output_tokens", 0)
+                * route_data.get("total_requests", 0)
+            )
 
         return cls(
             raw=data,
@@ -52,6 +60,30 @@ class MetricsSnapshot:
             total_input_tokens=total_in,
             total_output_tokens=total_out,
         )
+
+
+def diff_endpoints(before: MetricsSnapshot, after: MetricsSnapshot) -> dict[str, int]:
+    """Diff by_endpoint request counts between two snapshots.
+
+    Returns a dict of {endpoint: delta_requests} for endpoints that changed.
+    This reveals which provider:model BitRouter selected between snapshots.
+    """
+    before_endpoints: dict[str, int] = {}
+    after_endpoints: dict[str, int] = {}
+
+    for routes, target in [(before.raw, before_endpoints), (after.raw, after_endpoints)]:
+        for route_data in routes.get("routes", {}).values():
+            for endpoint, ep_data in route_data.get("by_endpoint", {}).items():
+                target[endpoint] = target.get(endpoint, 0) + ep_data.get("total_requests", 0)
+
+    delta: dict[str, int] = {}
+    all_keys = set(before_endpoints) | set(after_endpoints)
+    for key in all_keys:
+        d = after_endpoints.get(key, 0) - before_endpoints.get(key, 0)
+        if d > 0:
+            delta[key] = d
+
+    return delta
 
 
 class CostMeter:
@@ -87,6 +119,20 @@ class CostMeter:
         if self._baseline is not None:
             cost = self._calculate_cost(self._baseline, final)
         return final, cost
+
+    async def turn_diff(self) -> dict[str, int]:
+        """Snapshot and diff endpoints since last snapshot.
+
+        Call this after each agent turn to see which model was selected.
+        Returns {endpoint: request_count_delta}.
+        """
+        if self._baseline is None:
+            return {}
+        current = await self.snapshot()
+        delta = diff_endpoints(self._baseline, current)
+        # Update baseline for next diff
+        self._baseline = current
+        return delta
 
     def _calculate_cost(
         self,
